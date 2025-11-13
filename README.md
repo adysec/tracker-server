@@ -2,10 +2,6 @@
 
 > 一个面向 BitTorrent 客户端的“多协议聚合 + 缓存”前置 Tracker 服务，仅暴露标准 `/announce` 接口，通过同时（或提前）向多种上游 tracker 请求来最大化 peer 数量、降低单点与空列表概率。
 
-Author: **AdySec** <admin@adysec.com>  
-License: **MIT**
-
----
 
 ## ⭐ 特性速览
 
