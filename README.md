@@ -1,247 +1,415 @@
-# tracker-server
+# Tracker Server
 
-> 一个面向 BitTorrent 客户端的“多协议聚合 + 缓存”前置 Tracker 服务，仅暴露标准 `/announce` 接口，通过同时（或提前）向多种上游 tracker 请求来最大化 peer 数量、降低单点与空列表概率。
+BitTorrent Tracker 服务器，使用进程内存作为后端存储；仅提供标准 `/announce` 端点，并内置多协议上游聚合与负载均衡。
 
+## 功能特性
 
-## ⭐ 特性速览
+- 标准 BitTorrent Tracker 协议（BEP‑3/23）：HTTP `/announce`，响应 bencode，支持 compact 和 dictionary 模式
+- 智能上游聚合：从上游 Trackers 聚合 peers（HTTP/UDP/WebSocket），可并发抓取并写入本地内存存储
+- 负载均衡策略：All / RoundRobin / Random，可通过环境变量切换
+- 快速模式（Fast announce）：Wait / Timeout / Async / Off，多场景权衡响应时延与新鲜度
+- TLS 回退：优先 rustls，失败时可回退 native-tls（可关闭）
+- 原始 info_hash 解析：保留请求中的百分号编码原始字节，兼容 hex/base32/URN/double-encoded
+- 自动清理：TTL 机制定期删除过期 peers
+- 可静默告警：环境变量控制是否压制非致命告警
 
-- 纯标准接口：只提供 `/announce`（去除所有非标准调试/统计端点）。
-- 多协议聚合：自动分类并并发请求 HTTP(S) / UDP / WebSocket(WebTorrent) trackers。
-- 快速模式（Fast Announce）：四种策略 `wait` / `timeout` / `async` / `off`，并有首见空缓存的智能降级。
-- 按需聚合：响应前若缓存不足自动限时补抓（HTTP 全量 + UDP 50 + WS 10）。
-- 负载均衡：`LOAD_BALANCE_ALL=1` 轮转全列表，避免少数上游过载、其余闲置。
-- 高并发：默认并发阈值取 HTTP tracker 数量（至少 50），可通过 `AGG_MAX_CONCURRENCY` 调整。
-- TLS 回退：Rustls 失败自动尝试 native-tls 以获得更高的兼容性。
-- Python 兼容路径：可调用同目录下脚本 `4-tracker_spider.py` 以最大化和旧实现的抓取一致性。
-- 宽松 `peer_id` 处理：接受非 20 字节长度（仅日志提示），上游可回退到内部伪装 ID。
-- 信息哈希解析兼容：hex / 百分号编码 / 原始 20 字节容错。
-- 可静默告警：`SUPPRESS_WARN=1` 关闭所有 warn 级输出，仅保留 info。
-- TTL 清理：每次 announce 清理过期 peers，防止无限膨胀。
+## 编译
 
----
-
-## 📋 目录 (Table of Contents)
-1. [架构概述](#架构概述)
-2. [安装与构建](#安装与构建)
-3. [快速开始](#快速开始)
-4. [环境变量配置](#环境变量配置)
-5. [使用说明 /announce](#使用说明-announce)
-6. [info_hash 兼容性详解](#info_hash-兼容性详解)
-7. [负载均衡与并发](#负载均衡与并发)
-8. [Python 爬虫兼容模式](#python-爬虫兼容模式)
-9. [性能与实践建议](#性能与实践建议)
-10. [Roadmap](#roadmap)
-11. [贡献指南](#贡献指南)
-12. [许可证](#许可证)
-13. [作者](#作者)
-14. [致谢](#致谢)
-
----
-
-## 架构概述
-tracker-server 作为客户端与多组上游 tracker 之间的前置层：
-
-```
-Client ── announce ─▶ tracker-server ──┬─ HTTP trackers
-									   ├─ UDP trackers
-									   └─ WS(WebTorrent) trackers
-						▲  缓存 (SQLite + TTL)
-						└─ 后台轮询 / 按需聚合
-```
-
-核心流程：
-1. 客户端 `/announce` 请求到来 → 解析参数与 info_hash → 本地 upsert / register。  
-2. Fast 模式（可阻塞或异步）选取一批上游立即抓取。  
-3. 若缓存不足（`peers < numwant/2`），触发按需聚合（多协议并发 + 超时限制）。  
-4. 汇总与清理（TTL）后构造标准 bencode 响应。  
-5. 后台任务对已登记 info_hash 定期轮询 HTTP 上游填充缓存。  
-
----
-
-## 安装与构建
-```sh
-git clone <repo-url> tracker-server
-cd tracker-server
+```bash
 cargo build --release
 ```
-生成的二进制当前名与包名一致：`tracker-server`（可在 `Cargo.toml` 中通过 `package.name` 重命名）。
 
-运行：
-```sh
+编译后的二进制文件位于 `target/release/tracker-server`。
+
+## 使用方法
+
+### 基本用法
+
+```bash
+./target/release/tracker-server \
+  --bind 0.0.0.0:1337
+```
+
+### 命令行参数
+
+| 参数 | 默认值 | 说明 |
+|-----|--------|-----|
+| `--bind` | 0.0.0.0:1337 | 服务器绑定地址和端口 |
+| `--interval` | 900 | Announce 间隔（秒） |
+| `--min-interval` | 450 | 最小 announce 间隔（秒） |
+| `--peer-ttl` | 3600 | Peer 生存时间（秒） |
+
+### 重要环境变量（可选）
+
+- `LOAD_BALANCE_ALL=1`：强制所有请求聚合所有上游（忽略选择策略），默认关闭
+- `UPSTREAM_STRATEGY=all|rr|random`：选择 HTTP 上游策略（默认 `rr`）
+- `FAST_ANNOUNCE_MODE=off|wait|timeout|async`：快速模式（默认 `wait`）
+- `FAST_MAX_WAIT_MS=xxx`：快速模式最长等待时间（默认 500ms）
+- `AGG_CONCURRENCY=xxx`：聚合 HTTP 并发数（默认 32）
+- `ENABLE_NATIVE_TLS_FALLBACK=1`：在 rustls 失败时尝试 native-tls（默认关闭）
+- `TRACKERS_URLS=https://...;https://...`：上游 tracker 列表地址（多地址用分号分隔）
+- `TRACKERS_FILE=/path/trackers.txt`：本地 tracker 列表文件（与 URL 二选一，URL 优先）
+- `TRACKERS_REFRESH_SECS=86400`：tracker 列表刷新周期（默认 86400 秒）
+- `POLL_INTERVAL_SECS=60`：后台轮询已知 info_hash 的聚合周期（默认 60 秒）
+- `SUPPRESS_WARN=1`：关闭部分非致命告警输出
+
+### 示例
+
+```bash
+# 使用默认配置
 ./target/release/tracker-server
+
+# 自定义端口和间隔
+./target/release/tracker-server \
+  --bind 0.0.0.0:8080 \
+  --interval 1800 \
+  --peer-ttl 7200
 ```
 
----
+## API 端点
 
-## 快速开始
-最小化运行（默认使用 `trackers.txt`）：
-```sh
-FAST_ANNOUNCE_MODE=timeout \
-UPSTREAM_STRATEGY=round_robin \
-LOAD_BALANCE_ALL=1 \
-cargo run
+### 1. `/announce` - BitTorrent Tracker Announce
+
+**BitTorrent 客户端使用的标准 announce 端点。**
+
+#### 请求参数（GET）
+
+| 参数 | 必填 | 说明 |
+|-----|------|-----|
+| `info_hash` | 是 | 种子的 info hash（20 字节，URL 编码或 40 字节十六进制） |
+| `peer_id` | 是 | 客户端 peer ID（20 字节，URL 编码） |
+| `port` | 是 | 客户端监听端口 |
+| `uploaded` | 否 | 已上传字节数 |
+| `downloaded` | 否 | 已下载字节数 |
+| `left` | 否 | 剩余字节数（0 表示做种） |
+| `event` | 否 | 事件类型：`started`、`completed`、`stopped` |
+| `numwant` | 否 | 期望获取的 peer 数量（默认 50，最大 200） |
+| `compact` | 否 | 是否使用 compact 格式（1=是，0=否，默认 1） |
+| `no_peer_id` | 否 | 是否省略 peer_id（1=是，0=否，默认 0） |
+| `ip` | 否 | 客户端 IP 地址（可选覆盖） |
+
+#### 客户端 IP 检测（支持 CDN/代理）
+
+Tracker 会按以下优先级自动检测客户端真实 IP：
+
+1. **查询参数 `?ip=`**：客户端自己声明的 IP（最高优先级）
+2. **CF-Connecting-IP 头**：Cloudflare CDN 提供的真实客户端 IP（推荐用于 CF 场景）
+   - 支持多种大小写变体：`CF-Connecting-IP`、`cf-connecting-ip`、`Cf-Connecting-Ip`
+3. **X-Forwarded-For 头**：标准代理转发头，自动提取第一个 IP
+   - 支持大小写变体：`X-Forwarded-For`、`x-forwarded-for`
+4. **X-Real-IP 头**：Nginx 等反向代理常用的真实 IP 头
+   - 支持大小写变体：`X-Real-IP`、`x-real-ip`
+5. **TCP 连接 IP**：直连场景下的客户端 socket 地址（无代理时使用）
+
+**大小写兼容性说明：**
+- HTTP 头名称本身是大小写不敏感的（RFC 7230），但不同的代理/CDN 可能使用不同的大小写形式
+- 本实现会尝试多种常见的大小写变体，确保最大兼容性
+- 例如：Cloudflare 通常使用 `CF-Connecting-IP`，但部分配置可能使用小写形式
+
+**Cloudflare CDN 部署说明：**
+
+当 tracker-server 部署在 Cloudflare CDN 后面时：
+- ✅ **可以正常获取**真实客户端 IP（通过 `CF-Connecting-IP` 头）
+- ✅ **可以正常获取**客户端 Port（从查询参数 `?port=`）
+- ⚠️ 需要在 Cloudflare 中配置将 tracker 域名设置为 **DNS Only**（灰云），或者：
+  - 在 Cloudflare Page Rules 中为 `/announce` 路径禁用代理（Bypass Cache）
+  - 原因：Cloudflare 默认会缓存某些 GET 请求，可能导致 announce 响应不准确
+
+**其他 CDN/反向代理：**
+- Nginx：会设置 `X-Real-IP` 和 `X-Forwarded-For`
+- Apache：使用 `mod_remoteip` 设置 `X-Forwarded-For`
+- 其他 CDN：通常会设置 `X-Forwarded-For`
+
+**安全过滤：**
+- 所有来自 `127.0.0.1` 的 peer 会被自动过滤，不会写入存储
+
+#### 响应格式（Bencoded）
+
+**Compact 模式（默认）：**
+```
+d8:intervali900e12:min intervali450e10:tracker id16:a1b2c3d4e5f6...8:completei5e10:incompletei10e5:peers<binary>e
 ```
 
-示例客户端请求：
-```sh
-curl 'http://127.0.0.1:8080/announce?ih=<40hex>&peer_id=-qB4630-ABCDEFGHIJKLMNOPQRST&port=51413&left=0&numwant=80'
+peers 字段为二进制字符串，每 6 字节表示一个 peer（4 字节 IPv4 + 2 字节端口）。
+
+**Dictionary 模式（compact=0）：**
+```
+d8:intervali900e...5:peersld2:ip12:192.168.1.1004:porti6881e7:peer id20:...eed2:ip13:203.0.113.454:porti51413eee
 ```
 
----
+peers 字段为字典列表，每个字典包含 `ip`、`port`，可选 `peer id`。
 
-## 环境变量配置
-| 变量 | 说明 | 默认 |
-|------|------|------|
-| `BIND` | 监听地址 | `0.0.0.0:8080` |
-| `DATABASE_URL` | SQLite 连接串 | `sqlite:trackers.db` |
-| `POLL_INTERVAL_SECONDS` | 后台轮询间隔 | `60` |
-| `UPSTREAM_STRATEGY` | 上游策略 `all|round_robin|random` | `round_robin` |
-| `UPSTREAM_BATCH_SIZE` | fast/poll 批量大小（被 LOAD_BALANCE_ALL 覆盖时忽略） | `10` |
-| `FAST_ANNOUNCE_MODE` | `wait|timeout|async|off` | `timeout` |
-| `FAST_ANNOUNCE_MAX_WAIT_MS` | timeout 阻塞最长毫秒 | `2500` |
-| `UPSTREAM_TIMEOUT_SECONDS` | 单上游超时 | `10` |
-| `INTERVAL_SECONDS` | 响应 interval | `900` |
-| `MIN_INTERVAL_SECONDS` | min interval | `interval/2` |
-| `UPSTREAM_LEFT` | 上游 announce left 默认 | `16384` |
-| `UPSTREAM_NUMWANT` | 上游 numwant 上限 | `200` |
-| `AGG_MAX_CONCURRENCY` | HTTP 并发信号量大小 | `>=HTTP数, 至少50` |
-| `LOAD_BALANCE_ALL` | 全量轮转所有 HTTP 上游 | `0` |
-| `SUPPRESS_WARN` | 静默 warn 日志 | `0` |
-| `ENABLE_UDP` | 按需聚合启用 UDP | `1` |
-| `ENABLE_WS` | 按需聚合启用 WS | `1` |
-| `ON_DEMAND_MAX_WAIT_MS` | 按需聚合最大等待 | `4000` |
-| `PEER_TTL_SECONDS` | Peer TTL（<=0禁用） | `3600` |
-| `ENABLE_NATIVE_TLS_FALLBACK` | rustls 失败回退 | `1` |
-| `USE_PY_SPIDER` | 先调用 Python 爬虫 | `1` |
-| `PY_SPIDER_TIMEOUT_MS` | Python 爬虫单次超时 | `5000` |
-| `PYTHON_BIN` | Python 可执行名 | `python3` |
-| `TRACKERS_FILE` | tracker 列表文件 | `trackers.txt` |
+#### 示例
 
-要点：
-* 首次空缓存 + `timeout` 会临时升级为 `wait`。
-* 开启 `LOAD_BALANCE_ALL` 后 fast/poll 忽略 batch，整表轮换。
-* 开启 `SUPPRESS_WARN` 后调试信息减少，仅保留 info 级关键统计。
+```bash
+# Compact 格式（默认）
+curl 'http://localhost:1337/announce?info_hash=%01%23%45%67%89%AB%CD%EF%01%23%45%67%89%AB%CD%EF%01%23%45%67&peer_id=-UT3450-ABCDEFGHIJKL&port=6881&uploaded=0&downloaded=0&left=1234567890&event=started'
 
----
+# Dictionary 格式
+curl 'http://localhost:1337/announce?info_hash=0123456789ABCDEF0123456789ABCDEF01234567&peer_id=-UT3450-ABCDEFGHIJKL&port=6881&compact=0&left=0'
 
-## 使用说明 /announce
-请求参数（与标准一致）：
-| 参数 | 描述 | 必需 | 备注 |
-|------|------|------|------|
-| `info_hash` / `ih` | 百分号编码 20 字节或 40 hex | 是 | 二选一即可 |
-| `peer_id` | 百分号编码 peer id | 是 | 长度可≠20（兼容） |
-| `port` | 客户端监听端口 | 是 | `>0` |
-| `left` | 剩余字节 | 否 | `completed` 自动置0 |
-| `event` | started/completed/stopped | 否 | |
-| `numwant` | 期望 peers 数 | 否 | 上限 200 |
-| `compact` | 1=紧缩 0=列表 | 否 | 默认1 |
-| `no_peer_id` | 非紧缩省略 peer_id | 否 | 默认0 |
-
-响应字段：`interval` / `min interval` / `tracker id` / `complete` / `incomplete` / `peers`。
-
-示例：
-```sh
-curl 'http://127.0.0.1:8080/announce?ih=e831fcfaca5f0208009406b7b090014cef9228a9&peer_id=-qB4630-ABCDEFGHIJKLMNOPQRST&port=51413&left=0&numwant=80&compact=1'
+# Stopped 事件
+curl 'http://localhost:1337/announce?info_hash=...&peer_id=...&port=6881&event=stopped'
 ```
 
----
+注：自本版本起，已移除非标准的 `/peers/:info_hash` JSON API。
 
-## info_hash 兼容性详解
-支持：
-1. 百分号编码 20 原始字节：`%aa%bb...`
-2. 40 十六进制：`e831fcfa...`
-3. 参数别名：`ih=` 与 `info_hash=` 任选其一。
-4. 可选 `0x` 前缀。
-5. 原始长度 20 ASCII 容错（不推荐）。
+### info_hash 参数格式支持
 
-实现策略：优先从原始查询串抓取百分号编码，避免已解码后高位字节损坏；失败即返回 `failure reason: bad info_hash format`。
+`/announce` 支持以下多种 `info_hash` 表达形式：
 
----
+- Percent-Encoded 原始 20 字节：`%aa%bb%cc...`（BEP‑3 标准格式）
+- 40 字节十六进制：`0123456789abcdef...`（大小写不敏感）
+- 32 字节 Base32（BTIH）：`MTGDK...`（来自 magnet 的 xt）
+- 带前缀 URN：`urn:btih:...`（自动剥离）
+- 双重编码：`%25aa%25bb...`（自动修正）
 
-## 负载均衡与并发
-* `LOAD_BALANCE_ALL=1`：fast 与 poll 阶段对 HTTP trackers 做整列表轮询，每次起点单步递增，确保热度均匀。
-* 正常模式：`round_robin` / `random` / `all` 受 `UPSTREAM_BATCH_SIZE` 限制。
-* 并发：通过信号量控制，默认至少 50；避免在 tracker 很多时出现串行等待。
-* 按需聚合始终尝试“尽可能多”协议（HTTP 全量 + UDP/WS 截取）。
+## 输出日志
 
----
+所有日志采用结构化格式（tracing）：
 
-## Python 爬虫兼容模式
-开启 `USE_PY_SPIDER=1` 时：
-1. 优先执行 `4-tracker_spider.py --json` 聚合。  
-2. 若成功写入 peers → 继续正常响应。  
-3. 若失败或超时 → 回退 Rust 原生抓取流程。  
-
-用途：弥补某些 tracker 在 Python 宽松 TLS / 不同 UA 下的可访问性差异，最大限度保持旧脚本行为一致。
-
----
-
-## 性能与实践建议
-| 场景 | 建议 |
-|------|------|
-| 初次大量 info_hash | 使用 `wait` 或 `timeout` 提前填充缓存 |
-| 稳定运行降噪 | 设置 `SUPPRESS_WARN=1` |
-| 极端高延迟上游 | 减小 `FAST_ANNOUNCE_MAX_WAIT_MS` / `ON_DEMAND_MAX_WAIT_MS` |
-| 失败率高 | 观察 info 日志中 trackers_ok vs attempted，调整策略或剔除失效 tracker |
-| TLS 异常多 | 确认 `ENABLE_NATIVE_TLS_FALLBACK=1` 生效 |
-
----
-
-## Roadmap
-- [ ] Prometheus metrics 暴露
-- [ ] IPv6 peers 输出支持
-- [ ] 更细粒度的熔断与重试策略
-- [ ] 可选后台 UDP/WS 轮询
-- [ ] DHT / WebRTC 集成（实验）
-- [ ] GitHub Action 自动化质量门禁（fmt/clippy/test）
-
-### 自动更新 tracker 列表
-本仓库包含每日自动刷新 `trackers.txt` 的工作流：`.github/workflows/update-trackers.yml`。
-
-机制：
-1. 计划任务（cron）在 UTC 03:00 运行。
-2. 执行 `scripts/update_trackers.sh` 拉取多个公开源并去重排序。
-3. 写入 `tracker-server/trackers.txt`（或根目录 `trackers.txt`），添加时间戳与来源注释。
-4. 自动提交（`chore: daily tracker list update`）。
-
-自定义：
-* 修改 `scripts/update_trackers.sh` 中 `SOURCES` 数组添加或移除源。
-* 调整 workflow cron 表达式改变频率。
-* 若希望保留历史列表，可在脚本中追加 `cp` 到带日期副本目录。
-
-注意：公共源可能偶尔失效；脚本对失败的 URL 打印警告但继续处理其他来源。
-
-欢迎提交 Issue / PR 讨论优先级。
-
----
-
-## 贡献指南
-1. Fork 仓库并创建特性分支。  
-2. 保持最小侵入：不破坏现有 `/announce` 行为。  
-3. 提交前运行：`cargo fmt && cargo clippy && cargo test`。  
-4. 在 PR 中描述动机、实现与风险。  
-
----
-
-## 作者
-AdySec <admin@adysec.com>
-
----
-
-## 致谢
-* BitTorrent 协议与社区文档。
-* 开源依赖：`axum`、`tokio`、`sqlx`、`reqwest`、`tokio-tungstenite` 等。
-* 以及所有提交 tracker 列表与兼容性反馈的贡献者。
-
-如果本项目对你有帮助，欢迎 Star 🌟。
-
----
-
-## 附录：文件结构
+### 启动日志
 ```
-src/main.rs          主服务入口 / 核心逻辑
-trackers.txt         上游 tracker 列表（支持注释 '#')
-4-tracker_spider.py  Python 兼容抓取脚本（--json 输出模式）
-Cargo.toml           Rust 构建与依赖
-README.md            项目文档（当前文件）
+2025-01-14T12:00:00.123Z  INFO tracker_server: tracker-server started bind="0.0.0.0:1337"
+2025-01-14T12:00:00.456Z  INFO tracker_server: starting HTTP server addr=0.0.0.0:1337
 ```
+
+### Announce 日志
+```
+2025-01-14T12:01:23.456Z  INFO tracker_server: announce served ih="a1b2c3d4..." peers_out=10 compact=true
+2025-01-14T12:01:23.789Z  INFO tracker_server: peer stopped ih="a1b2c3d4..." ip="192.168.1.100" port=6881
+
+### 上游聚合日志
+```
+INFO tracker_server: http aggregated ih="a1b2..." attempted=8 succeeded=6 inserted=120
+INFO tracker_server: udp aggregated ih="a1b2..." hubs=40 parsed=25 inserted=220
+INFO tracker_server: ws aggregated ih="a1b2..." hubs=8 parsed=3 inserted=36
+```
+```
+
+### 日志说明
+- 仅保留与客户端请求直接相关的 INFO 日志（announce served / peer stopped 等）。
+- 与上游聚合相关的日志降为 DEBUG 级别，默认不会输出；可通过 `RUST_LOG=debug` 查看。
+
+## 本地存储模型
+
+内存中存储 peer 信息：
+
+```json
+{
+  "info_hash": "40字节十六进制字符串",
+  "ip": "IPv4 地址",
+  "port": 端口号,
+  "left": "剩余字节数 (optional)",
+  "last_seen": "最后活跃时间戳"
+}
+```
+
+**去重机制：** 使用 `info_hash + ip + port` 作为唯一键，确保幂等性。
+
+## 工作原理
+
+### 1. Announce 处理 + 快速模式
+
+```
+客户端请求
+    ↓
+解析 info_hash, peer_id, port
+    ↓
+检查 event 类型
+    ├─ stopped → 删除对应 peer 并记录日志
+    └─ 其他 → 写入/更新本地存储
+         ↓
+查询现有 peers
+    ↓
+计算 seeders/leechers
+    ↓
+触发快速模式（必要时聚合 HTTP 上游，等待/限时等待/异步）
+  ↓
+生成 bencoded 响应
+    ↓
+返回给客户端
+```
+
+### 2. 后台清理任务
+
+每 5 分钟运行一次：
+
+1. 计算截止时间：`now - peer_ttl`
+2. 查询 `last_seen < 截止时间` 的 peers
+3. 删除过期 peers
+4. 记录删除数量
+
+### 3. 上游聚合任务
+
+- 周期性轮询已知的 `info_hash` 集合（可配置间隔）
+- 并发请求 HTTP/UDP/WS 多协议上游 tracker
+- 解析 compact peers，批量 upsert 到本地存储
+
+## 与 BitTorrent 客户端集成
+
+### 在 .torrent 文件中使用
+
+```
+announce: http://your-server.com:1337/announce
+```
+
+### 在 magnet 链接中使用
+
+```
+magnet:?xt=urn:btih:...&tr=http://your-server.com:1337/announce
+```
+
+### 支持的客户端
+
+理论上支持所有标准的 BitTorrent 客户端：
+- qBittorrent
+- Transmission
+- Deluge
+- μTorrent
+- BitComet
+- Aria2
+- 等等
+
+## 性能优化
+
+### 存储说明
+
+本项目当前使用进程内存保存 peer 数据；重启进程后数据会清空。
+
+### 反向代理（推荐）
+
+使用 Nginx 提高并发处理能力：
+
+```nginx
+upstream tracker {
+    server 127.0.0.1:1337;
+    server 127.0.0.1:1338;  # 可以运行多个实例
+}
+
+server {
+    listen 80;
+    server_name tracker.example.com;
+    
+    location / {
+        proxy_pass http://tracker;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+### 运行多个实例
+
+```bash
+# 实例 1
+./target/release/tracker-server --bind 0.0.0.0:1337
+
+# 实例 2
+./target/release/tracker-server --bind 0.0.0.0:1338
+```
+
+### 调整 TTL
+
+根据使用场景调整 peer 生存时间：
+
+```bash
+# 快速更新（适合活跃网络）
+./target/release/tracker-server --peer-ttl 1800
+
+# 长期保留（适合小众种子）
+./target/release/tracker-server --peer-ttl 86400
+```
+
+## 常见问题
+
+### Q: 如何保证种子数统计是实时准确的？
+
+- `complete` 基于当前 `left == 0` 的活跃 peer 数量实时计算。
+- `incomplete` 基于当前 `left != 0` 或未知 `left` 的活跃 peer 数量实时计算。
+- `event=stopped` 会即时移除该 peer。
+- 超过 `peer_ttl` 的 peer 会被后台任务清理。
+
+### Q: 端口被占用？
+
+```bash
+# 更改绑定端口
+./target/release/tracker-server --bind 0.0.0.0:8080
+```
+
+### Q: 如何调试 announce 请求？
+
+开启 debug 日志：
+
+```bash
+RUST_LOG=debug ./target/release/tracker-server
+```
+
+### Q: 支持 IPv6 吗？
+
+当前版本仅支持 IPv4。IPv6 支持可以在未来版本中添加。
+
+### Q: 可以添加访问控制吗？
+
+建议在反向代理（如 Nginx）层面实现：
+- IP 白名单/黑名单
+- 速率限制
+- 认证
+
+## 数据流向
+
+```
+BitTorrent 客户端
+    ↓
+HTTP GET /announce
+    ↓
+Tracker Server (本程序)
+    ↓
+本地内存存储
+  ↑
+Metadata Spider（通过 announce 获取 peers）
+```
+
+## 与其他组件的集成
+
+### 数据来源
+
+- **DHT Spider**: 发现 peers 并通过 announce 更新 peer 信息
+- **BitTorrent 客户端**: 通过 announce 更新 peer 信息
+
+### 数据消费
+
+- **BitTorrent 客户端**：通过 announce 响应获取 peers
+- **Metadata Spider**：通过标准 announce 获取 peers
+
+## 开发
+
+### 项目结构
+
+```
+src/
+├── main.rs          # 入口点，HTTP 服务器
+└── store.rs         # 本地 peer 存储与统计
+```
+
+### 运行测试
+
+```bash
+cargo test
+```
+
+### 代码检查
+
+```bash
+cargo clippy
+cargo fmt
+```
+
+## 协议参考
+
+- [BEP-3: The BitTorrent Protocol Specification](http://www.bittorrent.org/beps/bep_0003.html)
+- [BEP-23: Tracker Returns Compact Peer Lists](http://www.bittorrent.org/beps/bep_0023.html)
+
+## 许可证
+
+查看 LICENSE 文件。
