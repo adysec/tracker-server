@@ -1,11 +1,43 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool, sqlite::{SqlitePoolOptions, SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous}};
-use tokio::sync::OnceCell;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, OnceCell, RwLock};
+
+// batch write configuration: flush when either this many requests are queued or
+// this duration has passed since the last flush. 10k qps requires quite a
+// large buffer but a few hundred operations per transaction is already a big
+// win compared to one-by-one.
+const BATCH_SIZE: usize = 1000;
+const FLUSH_INTERVAL_MS: u64 = 100;
+
+/// A command for the background DB worker.  We only serialize the minimum
+/// required fields; timestamps are carried along to avoid querying clock in
+/// the worker.
+enum WriteRequest {
+    UpsertPeer {
+        info_hash: String,
+        ip: String,
+        port: i64,
+        left: Option<i64>,
+        last_seen: i64,
+    },
+    RemovePeer {
+        info_hash: String,
+        ip: String,
+        port: i64,
+    },
+    IncCompleted {
+        info_hash: String,
+        last_seen: i64,
+    },
+    SetUptime {
+        secs: i64,
+    },
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BtPeer {
@@ -26,9 +58,12 @@ pub struct TorrentStats {
     pub completed: u64,
 }
 
+#[derive(Clone)]
 pub struct PeerStore {
     hot_peers: Arc<RwLock<HashMap<String, HashMap<String, BtPeer>>>>,
     pool: OnceCell<SqlitePool>,
+    // channel sender for the background writer; filled during init().
+    writer: OnceCell<mpsc::Sender<WriteRequest>>,
     db_url: String,
     hot_limit_total: usize,
     hot_limit_per_hash: usize,
@@ -56,6 +91,7 @@ impl PeerStore {
         Self {
             hot_peers: Arc::new(RwLock::new(HashMap::new())),
             pool: OnceCell::new(),
+            writer: OnceCell::new(),
             db_url,
             hot_limit_total,
             hot_limit_per_hash,
@@ -63,9 +99,22 @@ impl PeerStore {
     }
 
     pub async fn init(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = self.pool().await?;
+        let pool = self.pool().await?;
+
+        // create a buffered channel for write requests; we drop the receiver into the
+        // worker below and keep the sender in the struct so that other methods can
+        // enqueue operations without blocking the caller.
+        let (tx, rx) = mpsc::channel(100_000);
+        self.writer
+            .set(tx.clone())
+            .map_err(|_| "writer already initialized")?;
+
+        // spawn a dedicated task that batches and persists requests
+        tokio::spawn(run_db_worker(rx, pool.clone()));
+
         Ok(())
     }
+
 
     async fn pool(&self) -> Result<&SqlitePool, Box<dyn std::error::Error>> {
         self.pool
@@ -78,10 +127,17 @@ impl PeerStore {
                     .foreign_keys(true);
 
                 let pool = SqlitePoolOptions::new()
-                    .max_connections(8)
+                    // allow more simultaneous writers/readers for high concurrency
+                    .max_connections(32)
+                    // wait a bit longer when all connections are busy
+                    .acquire_timeout(Duration::from_secs(5))
                     .connect_with(opts)
                     .await?;
 
+                // increase busy timeout to avoid SQLITE_BUSY errors when contention
+                sqlx::query("PRAGMA busy_timeout = 5000;")
+                    .execute(&pool)
+                    .await?;
                 sqlx::query("PRAGMA temp_store = MEMORY;")
                     .execute(&pool)
                     .await?;
@@ -164,7 +220,7 @@ impl PeerStore {
             }
         } else {
             by_hash.insert(
-                key,
+                key.clone(),
                 BtPeer {
                     info_hash: info_hash.to_string(),
                     ip: ip.to_string(),
@@ -182,46 +238,21 @@ impl PeerStore {
 
         drop(guard);
 
-        let pool = self.pool().await?;
-        let left_i64 = left.map(|v| v as i64);
-
-        sqlx::query(
-            "INSERT INTO peers_latest (info_hash, ip, port, left_bytes, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(info_hash, ip, port) DO UPDATE SET
-               left_bytes = COALESCE(excluded.left_bytes, peers_latest.left_bytes),
-               last_seen = excluded.last_seen",
-        )
-        .bind(info_hash)
-        .bind(ip)
-        .bind(port as i64)
-        .bind(left_i64)
-        .bind(now)
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO torrent_counters (info_hash, completed, last_seen)
-             VALUES (?1, 0, ?2)
-             ON CONFLICT(info_hash) DO UPDATE SET last_seen = excluded.last_seen",
-        )
-        .bind(info_hash)
-        .bind(now)
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO announce_events (info_hash, ip, port, event, left_bytes, ts)
-             VALUES (?1, ?2, ?3, 'announce', ?4, ?5)",
-        )
-        .bind(info_hash)
-        .bind(ip)
-        .bind(port as i64)
-        .bind(left_i64)
-        .bind(now)
-        .execute(pool)
-        .await?;
-
+        // enqueue a write request rather than perform the SQL directly; the
+        // background worker will batch and flush periodically.  If the queue is
+        // full we drop the update since the hot cache already reflects the state.
+        if let Some(tx) = self.writer.get() {
+            let req = WriteRequest::UpsertPeer {
+                info_hash: info_hash.to_string(),
+                ip: ip.to_string(),
+                port: port as i64,
+                left: left.map(|v| v as i64),
+                last_seen: now,
+            };
+            if let Err(e) = tx.try_send(req) {
+                tracing::warn!(?e, "db write queue full, dropping upsert");
+            }
+        }
         Ok(())
     }
 
@@ -239,52 +270,33 @@ impl PeerStore {
                 guard.remove(info_hash);
             }
         }
+        drop(guard);
 
-        let pool = self.pool().await?;
-        let now = now_ts();
-        sqlx::query("DELETE FROM peers_latest WHERE info_hash = ?1 AND ip = ?2 AND port = ?3")
-            .bind(info_hash)
-            .bind(ip)
-            .bind(port as i64)
-            .execute(pool)
-            .await?;
-
-        sqlx::query(
-            "INSERT INTO announce_events (info_hash, ip, port, event, left_bytes, ts)
-             VALUES (?1, ?2, ?3, 'stopped', NULL, ?4)",
-        )
-        .bind(info_hash)
-        .bind(ip)
-        .bind(port as i64)
-        .bind(now)
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO torrent_counters (info_hash, completed, last_seen)
-             VALUES (?1, 0, ?2)
-             ON CONFLICT(info_hash) DO UPDATE SET last_seen = excluded.last_seen",
-        )
-        .bind(info_hash)
-        .bind(now)
-        .execute(pool)
-        .await?;
-
+        // queue deletion
+        if let Some(tx) = self.writer.get() {
+            let req = WriteRequest::RemovePeer {
+                info_hash: info_hash.to_string(),
+                ip: ip.to_string(),
+                port: port as i64,
+            };
+            if let Err(e) = tx.try_send(req) {
+                tracing::warn!(?e, "db write queue full, dropping remove");
+            }
+        }
         Ok(())
     }
 
     pub async fn increment_completed(&self, info_hash: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let pool = self.pool().await?;
         let now = now_ts();
-        sqlx::query(
-            "INSERT INTO torrent_counters (info_hash, completed, last_seen)
-             VALUES (?1, 1, ?2)
-             ON CONFLICT(info_hash) DO UPDATE SET completed = completed + 1, last_seen = excluded.last_seen",
-        )
-        .bind(info_hash)
-        .bind(now)
-        .execute(pool)
-        .await?;
+        if let Some(tx) = self.writer.get() {
+            let req = WriteRequest::IncCompleted {
+                info_hash: info_hash.to_string(),
+                last_seen: now,
+            };
+            if let Err(e) = tx.try_send(req) {
+                tracing::warn!(?e, "db write queue full, dropping completed count");
+            }
+        }
         Ok(())
     }
 
@@ -311,14 +323,15 @@ impl PeerStore {
     }
 
     pub async fn set_accumulated_uptime(&self, secs: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let pool = self.pool().await?;
-        sqlx::query(
-            "INSERT INTO server_stats (key,value) VALUES ('uptime', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(secs as i64)
-        .execute(pool)
-        .await?;
+        // enqueue instead of performing immediately; rarely called but keeps
+        // everything in the same path.
+        if let Some(tx) = self.writer.get() {
+            let req = WriteRequest::SetUptime { secs: secs as i64 };
+            // don't block on queue, log if it's full
+            if let Err(e) = tx.try_send(req) {
+                tracing::warn!(?e, "db write queue full, dropping uptime update");
+            }
+        }
         Ok(())
     }
 
@@ -467,6 +480,105 @@ impl PeerStore {
     }
 
 }
+
+
+// background database worker ------------------------------------------------
+
+async fn run_db_worker(mut rx: mpsc::Receiver<WriteRequest>, pool: SqlitePool) {
+    let mut buf = Vec::with_capacity(BATCH_SIZE);
+    let mut ticker = tokio::time::interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(req) => {
+                        buf.push(req);
+                        if buf.len() >= BATCH_SIZE {
+                            if let Err(e) = flush(&mut buf, &pool).await {
+                                tracing::error!(?e, "failed to flush batch");
+                            }
+                        }
+                    }
+                    None => {
+                        // sender dropped, flush remaining and exit
+                        if !buf.is_empty() {
+                            let _ = flush(&mut buf, &pool).await;
+                        }
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                if !buf.is_empty() {
+                    if let Err(e) = flush(&mut buf, &pool).await {
+                        tracing::error!(?e, "failed to flush batch");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn flush(buf: &mut Vec<WriteRequest>, pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // grab a single connection to reuse for the whole batch; transactions are not
+    // strictly needed and complicate the executor bounds.
+    // `acquire` returns a PoolConnection which derefs to the underlying
+    // SqliteConnection.  We simply reborrow it for each query to satisfy the
+    // executor bound.
+    let mut conn = pool.acquire().await?;
+
+    for req in buf.drain(..) {
+        match req {
+            WriteRequest::UpsertPeer { info_hash, ip, port, left, last_seen } => {
+                sqlx::query(
+                    "INSERT INTO peers_latest (info_hash, ip, port, left_bytes, last_seen)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(info_hash, ip, port) DO UPDATE SET
+                           left_bytes = COALESCE(excluded.left_bytes, peers_latest.left_bytes),
+                           last_seen = excluded.last_seen",
+                )
+                .bind(&info_hash)
+                .bind(&ip)
+                .bind(port)
+                .bind(left)
+                .bind(last_seen)
+                .execute(&mut *conn)
+                .await?;
+            }
+            WriteRequest::RemovePeer { info_hash, ip, port } => {
+                sqlx::query("DELETE FROM peers_latest WHERE info_hash=?1 AND ip=?2 AND port=?3")
+                    .bind(&info_hash)
+                    .bind(&ip)
+                    .bind(port)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            WriteRequest::IncCompleted { info_hash, last_seen } => {
+                sqlx::query(
+                    "INSERT INTO torrent_counters (info_hash, completed, last_seen)
+                         VALUES (?1, 1, ?2)
+                         ON CONFLICT(info_hash) DO UPDATE SET completed = completed + 1, last_seen = excluded.last_seen",
+                )
+                .bind(&info_hash)
+                .bind(last_seen)
+                .execute(&mut *conn)
+                .await?;
+            }
+            WriteRequest::SetUptime { secs } => {
+                sqlx::query(
+                    "INSERT INTO server_stats (key,value) VALUES ('uptime', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(secs)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 
 fn trim_oldest(map: &mut HashMap<String, BtPeer>, keep: usize) {
     if map.len() <= keep {

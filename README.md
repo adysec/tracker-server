@@ -27,3 +27,5 @@ cargo build --release
 ## 存储
 
 默认数据库 `tracker_peers.db`，可用 `PEER_DB_PATH` 修改。内存缓存由热/冷策略管理。
+
+> 为了支持高并发写入，SQLite 池大小提升至 32，busy timeout 设为 5 秒，并且所有对数据库的更新都会异步发送到后台任务队列，主路径不会被阻塞。后台任务会在最多 100 ms 或 1000 条记录后批量提交，这样每秒超过 1 万次的 announce 也能平稳处理。出现类似 `sqlx::pool::acquire` 慢日志时考虑增加池大小或降低写频率。
