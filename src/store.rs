@@ -108,7 +108,13 @@ impl PeerStore {
                 )
                 .execute(&pool)
                 .await?;
-
+                sqlx::query("CREATE TABLE IF NOT EXISTS server_stats (
+                        key TEXT PRIMARY KEY,
+                        value INTEGER NOT NULL
+                    )",
+                )
+                .execute(&pool)
+                .await?;
                 sqlx::query(
                     "CREATE TABLE IF NOT EXISTS announce_events (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,6 +295,31 @@ impl PeerStore {
             .await?;
         let c: i64 = row.get("c");
         Ok(c as u64)
+    }
+
+    pub async fn get_accumulated_uptime(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let pool = self.pool().await?;
+        if let Ok(row) = sqlx::query("SELECT value FROM server_stats WHERE key='uptime'")
+            .fetch_one(pool)
+            .await
+        {
+            let v: i64 = row.get("value");
+            Ok(v as u64)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub async fn set_accumulated_uptime(&self, secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = self.pool().await?;
+        sqlx::query(
+            "INSERT INTO server_stats (key,value) VALUES ('uptime', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(secs as i64)
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn list_peers(

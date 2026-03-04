@@ -97,6 +97,7 @@ struct AppState {
     /// per-shard map of in-flight info_hash -> waiters
     upstream_inflight: Arc<Vec<Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>>>,
     app_started_at: std::time::Instant,
+    accumulated_uptime: Arc<AtomicU64>, // seconds from previous runs
     announce_queries: Arc<AtomicU64>,
     dht_enable: bool,
     dht_bootstrap: Arc<Vec<String>>,
@@ -194,6 +195,7 @@ async fn main() -> Result<()> {
         tracing::error!(?e, "failed to initialize peer store");
         return Err(anyhow::anyhow!("peer store initialization failed: {}", e));
     }
+    // load accumulated uptime from previous run
 
     debug!(
         bind = args.bind,
@@ -271,6 +273,7 @@ async fn main() -> Result<()> {
         upstream_inflight: Arc::new(upstream_inflight_vec),
         app_started_at: std::time::Instant::now(),
         announce_queries: Arc::new(AtomicU64::new(0)),
+        accumulated_uptime: Arc::new(AtomicU64::new(0)),
         dht_enable,
         dht_bootstrap: Arc::new(dht_bootstrap),
         dht_timeout,
@@ -281,6 +284,11 @@ async fn main() -> Result<()> {
         pex_timeout,
         pex_max_peers_per_hash,
     };
+
+    // load accumulated uptime from previous run
+    if let Ok(prev) = state.store.get_accumulated_uptime().await {
+        state.accumulated_uptime.store(prev, Ordering::Relaxed);
+    }
 
     // poll loop 按需刷新
     {
@@ -472,14 +480,17 @@ async fn announce(
     let client_ip = client_ip_string.as_str();
 
     let mut left = q.left;
-    if matches!(q.event.as_deref(), Some("completed")) {
+    // normalize event to lowercase for matching
+    let ev_lower = q.event.as_deref().map(|s| s.to_ascii_lowercase());
+    if ev_lower.as_deref() == Some("completed") {
         left = Some(0);
+        info!(ih=%info_hash_hex, "completed event received");
         if let Err(e) = state.store.increment_completed(&info_hash_hex).await {
             debug!(?e, ih=%info_hash_hex, "failed to increment completed counter");
         }
     }
 
-    if matches!(q.event.as_deref(), Some("stopped")) {
+    if ev_lower.as_deref() == Some("stopped") {
         if let Err(e) = state.store.remove_peer(&info_hash_hex, client_ip, port).await {
             debug!(?e, ih=%info_hash_hex, "failed to remove peer on stopped");
         }
@@ -789,12 +800,13 @@ async fn build_dashboard_snapshot(state: &AppState, search: Option<&str>) -> Das
         views.truncate(top_limit);
     }
 
+    let base = state.accumulated_uptime.load(Ordering::Relaxed);
+    let up = base + state.app_started_at.elapsed().as_secs();
     DashboardSnapshot {
         torrents: state.store.count_infohashes().await.unwrap_or(0),
         peers: peers_total,
-        // durable counter across restarts
         queries: state.store.count_announces().await.unwrap_or(0),
-        uptime: format_uptime(state.app_started_at.elapsed()),
+        uptime: format_uptime(Duration::from_secs(up)),
         top: views,
     }
 }
@@ -1560,6 +1572,12 @@ async fn poll_loop(state: AppState) {
                 });
             }
         }
+
+        // persist accumulated uptime each cycle
+        let base = st.accumulated_uptime.load(Ordering::Relaxed);
+        let elapsed = st.app_started_at.elapsed().as_secs();
+        let total = base + elapsed;
+        let _ = st.store.set_accumulated_uptime(total).await;
 
         tokio::time::sleep(st.poll_interval).await;
     }
