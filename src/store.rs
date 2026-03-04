@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use sqlx::{Row, SqlitePool, sqlite::{SqlitePoolOptions, SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous}};
+use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -13,19 +16,124 @@ pub struct BtPeer {
     pub last_seen: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TorrentStats {
+    pub info_hash: String,
+    pub seeders: usize,
+    pub leechers: usize,
+    pub total_peers: usize,
+    pub last_seen: i64,
+    pub completed: u64,
+}
+
 pub struct PeerStore {
-    peers: Arc<RwLock<HashMap<String, HashMap<String, BtPeer>>>>,
+    hot_peers: Arc<RwLock<HashMap<String, HashMap<String, BtPeer>>>>,
+    pool: OnceCell<SqlitePool>,
+    db_url: String,
+    hot_limit_total: usize,
+    hot_limit_per_hash: usize,
 }
 
 impl PeerStore {
     pub fn new() -> Self {
+        let db_path = std::env::var("PEER_DB_PATH").unwrap_or_else(|_| "tracker_peers.db".to_string());
+        let db_url = if db_path.starts_with("sqlite:") {
+            db_path
+        } else {
+            format!("sqlite://{}", db_path)
+        };
+        let hot_limit_total = std::env::var("HOT_PEER_LIMIT_TOTAL")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(300_000)
+            .max(10_000);
+        let hot_limit_per_hash = std::env::var("HOT_PEER_LIMIT_PER_INFOHASH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(3_000)
+            .max(100);
+
         Self {
-            peers: Arc::new(RwLock::new(HashMap::new())),
+            hot_peers: Arc::new(RwLock::new(HashMap::new())),
+            pool: OnceCell::new(),
+            db_url,
+            hot_limit_total,
+            hot_limit_per_hash,
         }
     }
 
     pub async fn init(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self.pool().await?;
         Ok(())
+    }
+
+    async fn pool(&self) -> Result<&SqlitePool, Box<dyn std::error::Error>> {
+        self.pool
+            .get_or_try_init(|| async {
+                let opts = SqliteConnectOptions::from_str(&self.db_url)
+                    .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .foreign_keys(true);
+
+                let pool = SqlitePoolOptions::new()
+                    .max_connections(8)
+                    .connect_with(opts)
+                    .await?;
+
+                sqlx::query("PRAGMA temp_store = MEMORY;")
+                    .execute(&pool)
+                    .await?;
+
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS peers_latest (
+                        info_hash TEXT NOT NULL,
+                        ip TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        left_bytes INTEGER NULL,
+                        last_seen INTEGER NOT NULL,
+                        PRIMARY KEY (info_hash, ip, port)
+                    )",
+                )
+                .execute(&pool)
+                .await?;
+
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS torrent_counters (
+                        info_hash TEXT PRIMARY KEY,
+                        completed INTEGER NOT NULL DEFAULT 0,
+                        last_seen INTEGER NOT NULL DEFAULT 0
+                    )",
+                )
+                .execute(&pool)
+                .await?;
+
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS announce_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        info_hash TEXT NOT NULL,
+                        ip TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        event TEXT NOT NULL,
+                        left_bytes INTEGER NULL,
+                        ts INTEGER NOT NULL
+                    )",
+                )
+                .execute(&pool)
+                .await?;
+
+                sqlx::query("CREATE INDEX IF NOT EXISTS idx_peers_infohash_last_seen ON peers_latest(info_hash, last_seen DESC)")
+                    .execute(&pool)
+                    .await?;
+                sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_infohash_ts ON announce_events(info_hash, ts DESC)")
+                    .execute(&pool)
+                    .await?;
+
+                Ok::<SqlitePool, sqlx::Error>(pool)
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
 
     pub async fn upsert_peer(
@@ -37,7 +145,8 @@ impl PeerStore {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let key = format!("{}:{}", ip, port);
         let now = now_ts();
-        let mut guard = self.peers.write().await;
+
+        let mut guard = self.hot_peers.write().await;
         let by_hash = guard
             .entry(info_hash.to_string())
             .or_insert_with(HashMap::new);
@@ -59,6 +168,54 @@ impl PeerStore {
                 },
             );
         }
+
+        if by_hash.len() > self.hot_limit_per_hash {
+            trim_oldest(by_hash, self.hot_limit_per_hash);
+        }
+        trim_total_hot(&mut guard, self.hot_limit_total);
+
+        drop(guard);
+
+        let pool = self.pool().await?;
+        let left_i64 = left.map(|v| v as i64);
+
+        sqlx::query(
+            "INSERT INTO peers_latest (info_hash, ip, port, left_bytes, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(info_hash, ip, port) DO UPDATE SET
+               left_bytes = COALESCE(excluded.left_bytes, peers_latest.left_bytes),
+               last_seen = excluded.last_seen",
+        )
+        .bind(info_hash)
+        .bind(ip)
+        .bind(port as i64)
+        .bind(left_i64)
+        .bind(now)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO torrent_counters (info_hash, completed, last_seen)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(info_hash) DO UPDATE SET last_seen = excluded.last_seen",
+        )
+        .bind(info_hash)
+        .bind(now)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO announce_events (info_hash, ip, port, event, left_bytes, ts)
+             VALUES (?1, ?2, ?3, 'announce', ?4, ?5)",
+        )
+        .bind(info_hash)
+        .bind(ip)
+        .bind(port as i64)
+        .bind(left_i64)
+        .bind(now)
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
@@ -69,14 +226,69 @@ impl PeerStore {
         port: u16,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let key = format!("{}:{}", ip, port);
-        let mut guard = self.peers.write().await;
+        let mut guard = self.hot_peers.write().await;
         if let Some(by_hash) = guard.get_mut(info_hash) {
             by_hash.remove(&key);
             if by_hash.is_empty() {
                 guard.remove(info_hash);
             }
         }
+
+        let pool = self.pool().await?;
+        let now = now_ts();
+        sqlx::query("DELETE FROM peers_latest WHERE info_hash = ?1 AND ip = ?2 AND port = ?3")
+            .bind(info_hash)
+            .bind(ip)
+            .bind(port as i64)
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO announce_events (info_hash, ip, port, event, left_bytes, ts)
+             VALUES (?1, ?2, ?3, 'stopped', NULL, ?4)",
+        )
+        .bind(info_hash)
+        .bind(ip)
+        .bind(port as i64)
+        .bind(now)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO torrent_counters (info_hash, completed, last_seen)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(info_hash) DO UPDATE SET last_seen = excluded.last_seen",
+        )
+        .bind(info_hash)
+        .bind(now)
+        .execute(pool)
+        .await?;
+
         Ok(())
+    }
+
+    pub async fn increment_completed(&self, info_hash: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = self.pool().await?;
+        let now = now_ts();
+        sqlx::query(
+            "INSERT INTO torrent_counters (info_hash, completed, last_seen)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(info_hash) DO UPDATE SET completed = completed + 1, last_seen = excluded.last_seen",
+        )
+        .bind(info_hash)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn count_announces(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let pool = self.pool().await?;
+        let row = sqlx::query("SELECT COUNT(*) as c FROM announce_events")
+            .fetch_one(pool)
+            .await?;
+        let c: i64 = row.get("c");
+        Ok(c as u64)
     }
 
     pub async fn list_peers(
@@ -84,11 +296,56 @@ impl PeerStore {
         info_hash: &str,
         limit: usize,
     ) -> Result<Vec<BtPeer>, Box<dyn std::error::Error>> {
-        let guard = self.peers.read().await;
-        let out = guard
+        let mut out: Vec<BtPeer> = {
+            let guard = self.hot_peers.read().await;
+            guard
             .get(info_hash)
             .map(|m| m.values().take(limit).cloned().collect())
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
+
+        if out.len() < limit {
+            let pool = self.pool().await?;
+            let rows = sqlx::query(
+                "SELECT ip, port, left_bytes, last_seen
+                 FROM peers_latest
+                 WHERE info_hash = ?1
+                 ORDER BY last_seen DESC
+                 LIMIT ?2",
+            )
+            .bind(info_hash)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await?;
+
+            let mut seen: HashMap<String, ()> = out
+                .iter()
+                .map(|p| (format!("{}:{}", p.ip, p.port), ()))
+                .collect();
+
+            for row in rows {
+                let ip: String = row.try_get("ip")?;
+                let port: i64 = row.try_get("port")?;
+                let key = format!("{}:{}", ip, port);
+                if seen.contains_key(&key) {
+                    continue;
+                }
+                let left_bytes: Option<i64> = row.try_get("left_bytes")?;
+                let last_seen: i64 = row.try_get("last_seen")?;
+                out.push(BtPeer {
+                    info_hash: info_hash.to_string(),
+                    ip: ip.clone(),
+                    port: port as u16,
+                    left: left_bytes.map(|v| v as u64),
+                    last_seen,
+                });
+                seen.insert(key, ());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+
         Ok(out)
     }
 
@@ -96,53 +353,141 @@ impl PeerStore {
         &self,
         info_hash: &str,
     ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-        let guard = self.peers.read().await;
-        let Some(by_hash) = guard.get(info_hash) else {
-            return Ok((0, 0));
-        };
+        let pool = self.pool().await?;
+        let row = sqlx::query(
+            "SELECT
+                SUM(CASE WHEN left_bytes = 0 THEN 1 ELSE 0 END) AS complete,
+                SUM(CASE WHEN left_bytes = 0 THEN 0 ELSE 1 END) AS incomplete
+             FROM peers_latest
+             WHERE info_hash = ?1",
+        )
+        .bind(info_hash)
+        .fetch_one(pool)
+        .await?;
 
-        let mut complete = 0usize;
-        let mut incomplete = 0usize;
-        for peer in by_hash.values() {
-            if peer.left == Some(0) {
-                complete += 1;
-            } else {
-                incomplete += 1;
-            }
-        }
-        Ok((complete, incomplete))
+        let complete: Option<i64> = row.try_get("complete")?;
+        let incomplete: Option<i64> = row.try_get("incomplete")?;
+        Ok((complete.unwrap_or(0) as usize, incomplete.unwrap_or(0) as usize))
     }
 
     pub async fn list_all_infohashes(
         &self,
         limit: usize,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let guard = self.peers.read().await;
-        Ok(guard.keys().take(limit).cloned().collect())
+        let pool = self.pool().await?;
+        let rows = sqlx::query(
+            "SELECT info_hash FROM torrent_counters ORDER BY last_seen DESC LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(row.try_get::<String, _>("info_hash")?);
+        }
+        Ok(out)
     }
 
-    pub async fn prune_old_peers(
-        &self,
-        cutoff_timestamp: i64,
-    ) -> Result<u64, Box<dyn std::error::Error>> {
-        let mut removed = 0u64;
-        let mut guard = self.peers.write().await;
-        let mut empty_hashes = Vec::new();
+    pub async fn count_infohashes(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let pool = self.pool().await?;
+        let row = sqlx::query("SELECT COUNT(*) AS cnt FROM torrent_counters")
+            .fetch_one(pool)
+            .await?;
+        let cnt: i64 = row.try_get("cnt")?;
+        Ok(cnt as usize)
+    }
 
-        for (info_hash, by_hash) in guard.iter_mut() {
-            let before = by_hash.len();
-            by_hash.retain(|_, peer| peer.last_seen >= cutoff_timestamp);
-            removed += (before - by_hash.len()) as u64;
-            if by_hash.is_empty() {
-                empty_hashes.push(info_hash.clone());
+    pub async fn list_torrent_stats(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TorrentStats>, Box<dyn std::error::Error>> {
+        let pool = self.pool().await?;
+        let rows = sqlx::query(
+            "SELECT
+                p.info_hash AS info_hash,
+                SUM(CASE WHEN p.left_bytes = 0 THEN 1 ELSE 0 END) AS seeders,
+                SUM(CASE WHEN p.left_bytes = 0 THEN 0 ELSE 1 END) AS leechers,
+                COUNT(*) AS total_peers,
+                MAX(p.last_seen) AS last_seen,
+                COALESCE(tc.completed, 0) AS completed
+             FROM peers_latest p
+             LEFT JOIN torrent_counters tc ON tc.info_hash = p.info_hash
+             GROUP BY p.info_hash
+             ORDER BY total_peers DESC
+             LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(TorrentStats {
+                info_hash: row.try_get::<String, _>("info_hash")?,
+                seeders: row.try_get::<i64, _>("seeders")? as usize,
+                leechers: row.try_get::<i64, _>("leechers")? as usize,
+                total_peers: row.try_get::<i64, _>("total_peers")? as usize,
+                last_seen: row.try_get::<i64, _>("last_seen")?,
+                completed: row.try_get::<i64, _>("completed")? as u64,
+            });
+        }
+
+        Ok(out)
+    }
+
+}
+
+fn trim_oldest(map: &mut HashMap<String, BtPeer>, keep: usize) {
+    if map.len() <= keep {
+        return;
+    }
+    let mut rows: Vec<(String, i64)> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_seen))
+        .collect();
+    rows.sort_by_key(|(_, ts)| *ts);
+    let remove_n = rows.len().saturating_sub(keep);
+    for (key, _) in rows.into_iter().take(remove_n) {
+        map.remove(&key);
+    }
+}
+
+fn trim_total_hot(
+    hot: &mut HashMap<String, HashMap<String, BtPeer>>,
+    total_limit: usize,
+) {
+    let mut total: usize = hot.values().map(|m| m.len()).sum();
+    if total <= total_limit {
+        return;
+    }
+
+    let target = total_limit.saturating_sub(total_limit / 10);
+    while total > target {
+        let mut oldest_hash: Option<String> = None;
+        let mut oldest_key: Option<String> = None;
+        let mut oldest_ts = i64::MAX;
+
+        for (ih, peers) in hot.iter() {
+            for (key, peer) in peers {
+                if peer.last_seen < oldest_ts {
+                    oldest_ts = peer.last_seen;
+                    oldest_hash = Some(ih.clone());
+                    oldest_key = Some(key.clone());
+                }
             }
         }
 
-        for ih in empty_hashes {
-            guard.remove(&ih);
+        let (Some(ih), Some(key)) = (oldest_hash, oldest_key) else {
+            break;
+        };
+        if let Some(by_hash) = hot.get_mut(&ih) {
+            if by_hash.remove(&key).is_some() {
+                total = total.saturating_sub(1);
+            }
+            if by_hash.is_empty() {
+                hot.remove(&ih);
+            }
         }
-
-        Ok(removed)
     }
 }
 

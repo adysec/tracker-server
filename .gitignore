@@ -1,0 +1,15 @@
+tracker_peers.db
+trackers.txt
+target/
+**/*.db
+**/*.sqlite
+**/*.db-wal
+**/*.db-shm
+*.log
+.DS_Store
+
+# ignore builds and editors
+**/target/
+*.swp
+*.swo
+

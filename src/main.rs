@@ -2,14 +2,15 @@ mod store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State, OriginalUri},
     http::StatusCode,
-    response::Response,
+    response::{Html, Response},
     routing::get,
     Router,
 };
@@ -20,8 +21,11 @@ use percent_encoding::percent_decode_str;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::sync::{RwLock, mpsc, oneshot, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::hash::{Hasher};
 use std::collections::hash_map::DefaultHasher;
+use time::{OffsetDateTime, UtcOffset, format_description::FormatItem};
+use time::macros::format_description;
 use tracing::{info, debug};
 use store::PeerStore;
 
@@ -74,7 +78,6 @@ struct AppState {
     store: Arc<PeerStore>,
     interval: i64,
     min_interval: i64,
-    peer_ttl: i64,
     // 上游 trackers 列表（热更新）
     trackers_http: Arc<RwLock<Vec<String>>>,
     trackers_udp: Arc<RwLock<Vec<String>>>,
@@ -93,7 +96,46 @@ struct AppState {
     upstream_shards: usize,
     /// per-shard map of in-flight info_hash -> waiters
     upstream_inflight: Arc<Vec<Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>>>,
+    app_started_at: std::time::Instant,
+    announce_queries: Arc<AtomicU64>,
+    dht_enable: bool,
+    dht_bootstrap: Arc<Vec<String>>,
+    dht_timeout: Duration,
+    dht_max_nodes: usize,
+    dht_random_queries: usize,
+    dht_listen_port: Option<u16>,
+    pex_enable: bool,
+    pex_timeout: Duration,
+    pex_max_peers_per_hash: usize,
+    // counters for debugging removed; discovery now contributes to peers/torrents totals
 }
+
+#[derive(Clone)]
+struct TorrentView {
+    filename: String,
+    info_hash: String,
+    seeders: usize,
+    leechers: usize,
+    completed: u64,
+    total_peers: usize,
+    last_seen: i64,
+}
+
+#[derive(Clone)]
+struct DashboardSnapshot {
+    torrents: usize,
+    peers: usize,
+    queries: u64,
+    uptime: String,
+    top: Vec<TorrentView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardQuery {
+    search: Option<String>,
+}
+
+static TS_FMT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
 
 #[derive(Clone)]
 struct UpstreamJob {
@@ -132,6 +174,19 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let addr: SocketAddr = args
+        .bind
+        .parse()
+        .context("failed to parse bind address")?;
+
+    if addr.ip().is_unspecified() {
+        eprintln!(
+            "[tracker-server] 启动中，访问地址将是: http://127.0.0.1:{}/",
+            addr.port()
+        );
+    } else {
+        eprintln!("[tracker-server] 启动中，访问地址将是: http://{}/", addr);
+    }
 
     let peer_store = Arc::new(PeerStore::new());
 
@@ -147,12 +202,14 @@ async fn main() -> Result<()> {
 
     // 启动时加载 trackers
     let trackers_urls_env = std::env::var("TRACKERS_URLS").ok();
-    let trackers_url_single = std::env::var("TRACKERS_URL").unwrap_or_else(|_| "https://raw.githubusercontent.com/adysec/tracker/main/trackers_all.txt".to_string());
+    let trackers_url_single = std::env::var("TRACKERS_URL").unwrap_or_else(|_| "https://raw.githubusercontent.com/adysec/tracker/main/trackers_best.txt".to_string());
     let trackers_urls: Vec<String> = if let Some(s) = trackers_urls_env { s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect() } else { vec![trackers_url_single.clone()] };
     let attempts = std::env::var("TRACKERS_DOWNLOAD_ATTEMPTS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(3);
     let trackers_file = std::env::var("TRACKERS_FILE").unwrap_or_else(|_| "trackers.txt".to_string());
+    eprintln!("[tracker-server] 正在加载 trackers 列表...");
     let _ = download_and_write_trackers_multi(&trackers_urls, &trackers_file, attempts).await;
     let (trackers_http_init, trackers_udp_init, trackers_ws_init) = load_trackers_multi(&trackers_file).await.unwrap_or_default();
+    eprintln!("[tracker-server] trackers 加载完成，HTTP:{} UDP:{} WS:{}", trackers_http_init.len(), trackers_udp_init.len(), trackers_ws_init.len());
 
     let poll_secs = std::env::var("POLL_INTERVAL_SECONDS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
     let strategy = std::env::var("UPSTREAM_STRATEGY").unwrap_or_else(|_| "round_robin".to_string());
@@ -164,6 +221,26 @@ async fn main() -> Result<()> {
     let agg_max_concurrency = std::env::var("AGG_MAX_CONCURRENCY").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(trackers_http_init.len().max(50));
     // upstream shards for smoothing upstream requests (per-infohash sharding)
     let upstream_shards = std::env::var("UPSTREAM_SHARDS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(16).max(1);
+    // DHT configuration is hard-coded; environment variables are ignored
+    let dht_enable = true;
+    let dht_bootstrap: Vec<String> = vec![
+        "router.bittorrent.com:6881".to_string(),
+        "dht.transmissionbt.com:6881".to_string(),
+        "router.utorrent.com:6881".to_string(),
+    ];
+    let dht_timeout = Duration::from_secs(3);
+    let dht_max_nodes = 64;
+    let dht_random_queries = 1;
+    let dht_listen_port = Some(6881);
+    let pex_enable = std::env::var("PEX_ENABLE").map(|v| v == "1").unwrap_or(false);
+    let pex_timeout = Duration::from_secs(
+        std::env::var("PEX_TIMEOUT_SECONDS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(3).max(1),
+    );
+    let pex_max_peers_per_hash = std::env::var("PEX_MAX_PEERS_PER_HASH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(2);
     let mut upstream_senders_vec: Vec<mpsc::Sender<UpstreamJob>> = Vec::with_capacity(upstream_shards);
     let mut upstream_receivers: Vec<mpsc::Receiver<UpstreamJob>> = Vec::with_capacity(upstream_shards);
     let mut upstream_inflight_vec: Vec<Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>> = Vec::with_capacity(upstream_shards);
@@ -178,7 +255,6 @@ async fn main() -> Result<()> {
         store: peer_store,
         interval: args.interval,
         min_interval: args.min_interval,
-        peer_ttl: args.peer_ttl,
         trackers_http: Arc::new(RwLock::new(trackers_http_init)),
         trackers_udp: Arc::new(RwLock::new(trackers_udp_init)),
         trackers_ws: Arc::new(RwLock::new(trackers_ws_init)),
@@ -193,56 +269,43 @@ async fn main() -> Result<()> {
         upstream_senders: Arc::new(upstream_senders_vec),
         upstream_shards,
         upstream_inflight: Arc::new(upstream_inflight_vec),
+        app_started_at: std::time::Instant::now(),
+        announce_queries: Arc::new(AtomicU64::new(0)),
+        dht_enable,
+        dht_bootstrap: Arc::new(dht_bootstrap),
+        dht_timeout,
+        dht_max_nodes,
+        dht_random_queries,
+        dht_listen_port,
+        pex_enable,
+        pex_timeout,
+        pex_max_peers_per_hash,
     };
-
-    // spawn per-shard workers to process upstream jobs sequentially per shard
-    for (i, mut rx) in upstream_receivers.into_iter().enumerate() {
-        let st = state.clone();
-        let inflight_map = st.upstream_inflight[i].clone();
-        tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
-                // gather trackers lists at processing time
-                let http = st.trackers_http.read().await.clone();
-                let udp = st.trackers_udp.read().await.clone();
-                let ws = st.trackers_ws.read().await.clone();
-                // best-effort: run aggregated fetch (this will upsert peers into local store)
-                let _ = aggregated_fetch(&st, &job.ih_hex, &job.ih_raw, &job.params, &http, &udp, &ws, st.timeout).await;
-                // notify waiters for this infohash and remove from inflight
-                let mut map = inflight_map.lock().await;
-                if let Some(waiters) = map.remove(&job.ih_hex) {
-                    for tx in waiters {
-                        let _ = tx.send(());
-                    }
-                }
-                // small yield to allow fairness
-                tokio::task::yield_now().await;
-            }
-        });
-    }
-
-    // TTL 清理任务 + 周期 poll 任务 + trackers 列表刷新
-    {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(300)).await;
-                let cutoff = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64 - state_clone.peer_ttl;
-                match state_clone.store.prune_old_peers(cutoff).await {
-                    Ok(count) if count > 0 => debug!(count, "pruned old peers"),
-                    Err(e) => debug!(?e, "failed to prune old peers"),
-                    _ => {}
-                }
-            }
-        });
-    }
 
     // poll loop 按需刷新
     {
         let state_clone = state.clone();
         tokio::spawn(async move { poll_loop(state_clone).await; });
+    }
+
+    // optional DHT listener for announce_peer crawl
+    if state.dht_enable {
+        if let Some(port) = state.dht_listen_port {
+            let st2 = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_dht_listener(st2, port).await {
+                    tracing::error!(?e, "dht listener error");
+                }
+            });
+        } else {
+            let st2 = state.clone();
+            tokio::spawn(async move {
+                // choose default 6881 if not specified
+                if let Err(e) = run_dht_listener(st2, 6881).await {
+                    tracing::error!(?e, "dht listener error");
+                }
+            });
+        }
     }
 
     // 每日刷新 trackers 列表
@@ -278,18 +341,25 @@ async fn main() -> Result<()> {
     }
 
     let app = Router::new()
+        .route("/", get(index_dashboard))
         .route("/announce", get(announce))
         .with_state(state);
 
-    let addr: SocketAddr = args
-        .bind
-        .parse()
-        .context("failed to parse bind address")?;
-    
     debug!(%addr, "starting HTTP server");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .context("failed to bind listener")?;
+
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+    if bound_addr.ip().is_unspecified() {
+        let dashboard = format!("http://127.0.0.1:{}/", bound_addr.port());
+        let announce_url = format!("http://127.0.0.1:{}/announce", bound_addr.port());
+        info!(%dashboard, announce=%announce_url, bind=%bound_addr, "tracker-server is ready");
+    } else {
+        let dashboard = format!("http://{}/", bound_addr);
+        let announce_url = format!("http://{}/announce", bound_addr);
+        info!(%dashboard, announce=%announce_url, bind=%bound_addr, "tracker-server is ready");
+    }
     
     axum::serve(
         listener,
@@ -321,6 +391,8 @@ async fn announce(
     Query(q): Query<AnnounceQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, StatusCode> {
+    state.announce_queries.fetch_add(1, Ordering::Relaxed);
+
     // Try to extract raw percent-encoded values from the original URI first
     let raw_info = orig
         .path_and_query()
@@ -402,6 +474,9 @@ async fn announce(
     let mut left = q.left;
     if matches!(q.event.as_deref(), Some("completed")) {
         left = Some(0);
+        if let Err(e) = state.store.increment_completed(&info_hash_hex).await {
+            debug!(?e, ih=%info_hash_hex, "failed to increment completed counter");
+        }
     }
 
     if matches!(q.event.as_deref(), Some("stopped")) {
@@ -568,8 +643,7 @@ async fn announce(
         }
     }
 
-    // TTL prune 和按需聚合
-    let _ = state.store.prune_old_peers(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - state.peer_ttl).await;
+    // maintain existing announce behavior; using store list as before
     let mut peers = state.store.list_peers(&info_hash_hex, numwant).await.unwrap_or_default();
     if peers.len() < numwant/2 {
         let http = state.trackers_http.read().await.clone();
@@ -663,6 +737,146 @@ async fn announce(
         .header("Content-Type", "text/plain")
         .body(Bytes::from(body).into())
         .unwrap())
+}
+
+async fn index_dashboard(
+    State(state): State<AppState>,
+    Query(q): Query<DashboardQuery>,
+) -> Html<String> {
+    let snapshot = build_dashboard_snapshot(&state, q.search.as_deref()).await;
+    Html(render_dashboard_html(&snapshot, q.search.as_deref()))
+}
+
+async fn build_dashboard_snapshot(state: &AppState, search: Option<&str>) -> DashboardSnapshot {
+    let max_scan = std::env::var("DASHBOARD_SCAN_INFOHASHES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(5000)
+        .max(100);
+    let top_limit = std::env::var("DASHBOARD_TOP_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .max(10);
+
+    let mut all = state.store.list_torrent_stats(max_scan).await.unwrap_or_default();
+
+    let mut peers_total = 0usize;
+    let mut views = Vec::with_capacity(all.len());
+    for item in all.drain(..) {
+        peers_total += item.total_peers;
+        let filename = format!("Torrent_{}.torrent", &item.info_hash[..item.info_hash.len().min(16)]);
+        views.push(TorrentView {
+            filename,
+            info_hash: item.info_hash,
+            seeders: item.seeders,
+            leechers: item.leechers,
+            completed: item.completed,
+            total_peers: item.total_peers,
+            last_seen: item.last_seen,
+        });
+    }
+
+    if let Some(s) = search.map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty()) {
+        views.retain(|v| {
+            v.info_hash.to_ascii_lowercase().contains(&s)
+                || v.filename.to_ascii_lowercase().contains(&s)
+        });
+    }
+
+    views.sort_by(|a, b| b.total_peers.cmp(&a.total_peers));
+    if views.len() > top_limit {
+        views.truncate(top_limit);
+    }
+
+    DashboardSnapshot {
+        torrents: state.store.count_infohashes().await.unwrap_or(0),
+        peers: peers_total,
+        // durable counter across restarts
+        queries: state.store.count_announces().await.unwrap_or(0),
+        uptime: format_uptime(state.app_started_at.elapsed()),
+        top: views,
+    }
+}
+
+fn render_dashboard_html(snapshot: &DashboardSnapshot, search: Option<&str>) -> String {
+    let mut rows_html = String::new();
+    for t in &snapshot.top {
+        rows_html.push_str(&format!(
+            "<article class=\"torrent-item\"><h3>📦 {}</h3><div class=\"chips\"><span class=\"chip chip-seed\">🌱 {} Seeds</span><span class=\"chip chip-leech\">📥 {} Leechers</span><span class=\"chip chip-comp\">✅ {} Completed</span></div><div class=\"hash\">Hash: {}</div><div class=\"meta\">Total Peers: {} · Last Seen: {}</div></article>",
+            escape_html(&t.filename),
+            t.seeders,
+            t.leechers,
+            t.completed,
+            escape_html(&t.info_hash),
+            t.total_peers,
+            escape_html(&fmt_ts(t.last_seen))
+        ));
+    }
+
+    let search_val = search.unwrap_or("");
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><title>Tracker Observatory</title><meta http-equiv=\"refresh\" content=\"30\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>
+        :root{{--bg:#0a0f1a;--panel:#111a2b;--panel2:#17233a;--line:#253759;--txt:#dce8ff;--muted:#8ea5cf;--a:#6ea8ff;--b:#8c7bff;--ok:#2fd27a;--warn:#ffcf5c;--info:#45caff}}
+        *{{box-sizing:border-box}}body{{margin:0;font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;background:radial-gradient(1200px 500px at 80% -10%,rgba(110,168,255,.12),transparent),radial-gradient(900px 500px at -20% 10%,rgba(140,123,255,.15),transparent),var(--bg);color:var(--txt)}}
+        .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}} .hero{{padding:20px 22px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(160deg,rgba(23,35,58,.95),rgba(17,26,43,.95));box-shadow:0 18px 42px rgba(0,0,0,.35)}}
+        .title{{margin:0;font-size:30px;letter-spacing:.4px}} .subtitle{{margin-top:8px;color:var(--muted);font-size:14px}}
+        .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:18px}} .stat{{border:1px solid var(--line);border-radius:14px;padding:14px;background:linear-gradient(180deg,var(--panel2),var(--panel))}}
+        .k{{font-size:34px;font-weight:800;line-height:1;background:linear-gradient(90deg,var(--a),var(--info));-webkit-background-clip:text;background-clip:text;color:transparent}} .label{{margin-top:8px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.1em}}
+        .section{{margin-top:22px;border:1px solid var(--line);border-radius:16px;background:rgba(17,26,43,.85);padding:16px}} .section h2{{margin:0 0 12px 0;font-size:18px}}
+        .search{{display:flex;gap:10px;flex-wrap:wrap}} .search input{{flex:1 1 320px;background:#0e1626;color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:15px;outline:none}} .search input:focus{{border-color:var(--a);box-shadow:0 0 0 3px rgba(110,168,255,.15)}}
+        .search button{{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(90deg,var(--a),var(--b));color:#081120;font-weight:700;cursor:pointer}}
+        .torrent-item{{border:1px solid var(--line);border-radius:14px;padding:14px;margin:0 0 10px 0;background:linear-gradient(180deg,#121d30,#0f1728)}} .torrent-item h3{{margin:0 0 10px 0;color:#b9d5ff;font-size:17px}}
+        .chips{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}} .chip{{padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}} .chip-seed{{background:rgba(47,210,122,.2);color:#7ff0ae;border:1px solid rgba(47,210,122,.4)}} .chip-leech{{background:rgba(255,207,92,.2);color:#ffe39a;border:1px solid rgba(255,207,92,.4)}} .chip-comp{{background:rgba(69,202,255,.18);color:#a9ebff;border:1px solid rgba(69,202,255,.4)}}
+        .hash{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);word-break:break-all}} .meta{{margin-top:8px;color:var(--muted);font-size:13px}}
+        .footer{{margin-top:8px;text-align:center;color:var(--muted);font-size:13px}}
+        </style></head><body><div class=\"wrap\"><header class=\"hero\"><h1 class=\"title\">Tracker Observatory</h1><div class=\"subtitle\">A custom dark dashboard for live swarm visibility</div>
+        <div class=\"stats\">    
+            <div class=\"stat\"><div class=\"k\">{}</div><div class=\"label\">Torrents</div></div>
+            <div class=\"stat\"><div class=\"k\">{}</div><div class=\"label\">Peers</div></div>
+            <div class=\"stat\"><div class=\"k\">{}</div><div class=\"label\">Queries</div></div>
+            <div class=\"stat\"><div class=\"k\">{}</div><div class=\"label\">Total Uptime</div></div>
+            </div></header>
+        <section class=\"section\"><h2>🔎 Search Torrents</h2><form class=\"search\" method=\"get\"><input type=\"text\" name=\"search\" placeholder=\"Search by filename or hash...\" value=\"{}\"><button type=\"submit\">Search</button></form></section>
+        <section class=\"section\"><h2>🌍 Active Torrents (Top 100)</h2>{}</section>
+        <div class=\"footer\">Auto-refresh: 30s</div></div></body></html>",
+        snapshot.torrents,
+        snapshot.peers,
+        snapshot.queries,
+        escape_html(&snapshot.uptime),
+        escape_html(search_val),
+        rows_html
+    )
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn fmt_ts(ts: i64) -> String {
+    let Ok(dt) = OffsetDateTime::from_unix_timestamp(ts) else {
+        return ts.to_string();
+    };
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    dt.to_offset(offset)
+        .format(TS_FMT)
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+fn format_uptime(d: Duration) -> String {
+    let s = d.as_secs();
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    if h > 0 {
+        format!("{}h {}m", h, m)
+    } else {
+        format!("{}m", m)
+    }
 }
 
 // 移除 /peers 非标准端点
@@ -908,8 +1122,406 @@ async fn parse_and_upsert(state: &AppState, ih_hex: &str, body: &Bytes) -> Resul
     Ok(count)
 }
 
+async fn dht_discover_peers(state: &AppState, ih_hex: &str, ih_raw: &[u8]) -> Result<usize> {
+    if state.dht_bootstrap.is_empty() {
+        info!(ih=%ih_hex, "dht bootstrap list empty, skipping");
+        return Ok(0);
+    }
+
+    info!(ih=%ih_hex, bootstraps=state.dht_bootstrap.len(), "starting dht discovery");
+
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let mut queue = VecDeque::<SocketAddr>::new();
+    let mut visited = HashSet::<SocketAddr>::new();
+
+    for b in state.dht_bootstrap.iter() {
+        if let Ok(addrs) = tokio::net::lookup_host(b).await {
+            for addr in addrs {
+                queue.push_back(addr);
+            }
+        }
+    }
+
+    let mut inserted = 0usize;
+    while let Some(target) = queue.pop_front() {
+        debug!(ih=%ih_hex, target=%target, visited=?visited.len(), "querying dht node");
+        if visited.len() >= state.dht_max_nodes {
+            break;
+        }
+        if !visited.insert(target) {
+            continue;
+        }
+        match dht_get_peers_once(&socket, target, ih_raw, state.dht_timeout).await {
+            Ok(resp) => {
+                for (ip, port) in extract_compact_peers_from_values(&resp) {
+                    if ip != "127.0.0.1" && state.store.upsert_peer(ih_hex, &ip, port, None).await.is_ok() {
+                        inserted += 1;
+                    }
+                }
+
+                // if we inserted peers via DHT, query upstream trackers to expand list for this infohash
+                if inserted > 0 {
+                    let http = state.trackers_http.read().await.clone();
+                    let subset = select_trackers(&http, state.upstream_strategy, state.batch_size, &state.rr_index);
+                    let params = UpstreamAnnounceParams { peer_id_encoded: (*PEER_ID_ENC).clone(), port: 6881, left: 16384, event: "started".to_string(), numwant: 100 };
+                    let _ = fetch_from_upstreams(state, &subset, ih_hex, ih_raw, &params).await;
+                }
+
+                for node in extract_dht_nodes_ipv4(&resp) {
+                    if !visited.contains(&node) {
+                        queue.push_back(node);
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    if inserted > 0 {
+        info!(ih=%ih_hex, inserted, visited_nodes=visited.len(), "dht discovery inserted peers");
+    } else {
+        debug!(ih=%ih_hex, visited_nodes=visited.len(), "dht discovery inserted no peers");
+    }
+    Ok(inserted)
+}
+
+async fn dht_get_peers_once(
+    socket: &tokio::net::UdpSocket,
+    target: SocketAddr,
+    ih_raw: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let txid = rand::thread_rng().gen::<u16>();
+    let mut node_id = [0u8; 20];
+    rand::thread_rng().fill(&mut node_id);
+
+    let mut msg = Vec::with_capacity(128);
+    msg.extend_from_slice(b"d1:ad2:id20:");
+    msg.extend_from_slice(&node_id);
+    msg.extend_from_slice(b"9:info_hash20:");
+    msg.extend_from_slice(ih_raw);
+    msg.extend_from_slice(b"e1:q9:get_peers1:t2:");
+    msg.extend_from_slice(&txid.to_be_bytes());
+    msg.extend_from_slice(b"1:y1:qe");
+
+    socket.send_to(&msg, target).await?;
+    let mut buf = [0u8; 4096];
+    let (n, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await??;
+    Ok(buf[..n].to_vec())
+}
+
+fn extract_compact_peers_from_values(body: &[u8]) -> Vec<(String, u16)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 10 < body.len() {
+        if &body[i..i + 9] == b"6:valuesl" {
+            i += 9;
+            while i < body.len() && body[i] != b'e' {
+                let mut len = 0usize;
+                while i < body.len() && body[i].is_ascii_digit() {
+                    len = len * 10 + (body[i] - b'0') as usize;
+                    i += 1;
+                }
+                if i >= body.len() || body[i] != b':' {
+                    break;
+                }
+                i += 1;
+                if i + len > body.len() {
+                    break;
+                }
+                let bytes = &body[i..i + len];
+                i += len;
+                if len % 6 == 0 {
+                    for chunk in bytes.chunks(6) {
+                        let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]).to_string();
+                        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                        out.push((ip, port));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn extract_dht_nodes_ipv4(body: &[u8]) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    if let Some(pos) = body.windows(7).position(|w| w == b"5:nodes") {
+        let mut i = pos + 7;
+        let mut len = 0usize;
+        while i < body.len() && body[i].is_ascii_digit() {
+            len = len * 10 + (body[i] - b'0') as usize;
+            i += 1;
+        }
+        if i < body.len() && body[i] == b':' {
+            i += 1;
+            if i + len <= body.len() {
+                let nodes = &body[i..i + len];
+                for chunk in nodes.chunks(26) {
+                    if chunk.len() != 26 {
+                        continue;
+                    }
+                    let ip = std::net::Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
+                    let port = u16::from_be_bytes([chunk[24], chunk[25]]);
+                    out.push(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+                }
+            }
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------
+// Minimal DHT listener used as a crawler; we answer queries and
+// record announce_peer events into the peer store. We do *not*
+// fetch or save torrent metadata, only info_hash and peer.
+
+async fn run_dht_listener(state: AppState, port: u16) -> Result<()> {
+    let addr = format!("0.0.0.0:{}", port);
+    let socket = tokio::net::UdpSocket::bind(&addr).await?;
+    info!(port, "dht listener bound");
+
+    // our own random node id (20 bytes)
+    let mut node_id = [0u8; 20];
+    rand::thread_rng().fill(&mut node_id);
+
+    let mut buf = [0u8; 4096];
+    loop {
+        let (n, src) = socket.recv_from(&mut buf).await?;
+        let pkt = &buf[..n];
+
+        // always try to respond with a basic DHT reply if we can extract the transaction id
+        if let Some(tfield) = extract_t_field(pkt) {
+            let mut resp = Vec::with_capacity(64 + tfield.len());
+            resp.extend_from_slice(b"d1:rd2:id20:");
+            resp.extend_from_slice(&node_id);
+            resp.extend_from_slice(b"e1:t");
+            resp.extend_from_slice(&tfield); // includes length, colon, and value
+            resp.extend_from_slice(b"1:y1:r");
+            let _ = socket.send_to(&resp, src).await;
+        }
+
+        // if this is an announce_peer query, extract info and store it
+        if let Some(ih) = extract_info_hash_from_dht(pkt) {
+            if let Some(port) = extract_port_from_dht(pkt) {
+                let ip = extract_ip_from_dht(pkt).unwrap_or_else(|| src.ip().to_string());
+                let ih_hex = hex::encode(ih);
+                let _ = state.store.upsert_peer(&ih_hex, &ip, port, None).await;
+                debug!(ih=%ih_hex, ip=%ip, port, "recorded announce_peer from DHT");
+            }
+        }
+    }
+}
+
+// helpers -------------------------------------------------------
+
+fn extract_t_field(buf: &[u8]) -> Option<Vec<u8>> {
+    // find the 't' key and return the entire length:value slice after the colon
+    if let Some(pos) = buf.windows(2).position(|w| w == b"1:t") {
+        let mut i = pos + 2;
+        // read length digits
+        let mut len = 0usize;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            len = len * 10 + (buf[i] - b'0') as usize;
+            i += 1;
+        }
+        if i < buf.len() && buf[i] == b':' {
+            i += 1;
+            if i + len <= buf.len() {
+                return Some(buf[pos + 2..i + len].to_vec());
+            }
+        }
+    }
+    None
+}
+
+fn extract_info_hash_from_dht(buf: &[u8]) -> Option<&[u8]> {
+    // look for the literal "9:info_hash20:" sequence
+    if let Some(pos) = buf.windows(13).position(|w| w == b"9:info_hash20:") {
+        let start = pos + 13;
+        if start + 20 <= buf.len() {
+            return Some(&buf[start..start + 20]);
+        }
+    }
+    None
+}
+
+fn extract_port_from_dht(buf: &[u8]) -> Option<u16> {
+    if let Some(pos) = buf.windows(6).position(|w| w == b"4:port") {
+        let mut i = pos + 6;
+        if i < buf.len() && buf[i] == b'i' {
+            i += 1;
+            let mut val = 0u16;
+            while i < buf.len() && buf[i].is_ascii_digit() {
+                val = val * 10 + (buf[i] - b'0') as u16;
+                i += 1;
+            }
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn extract_ip_from_dht(buf: &[u8]) -> Option<String> {
+    if let Some(pos) = buf.windows(3).position(|w| w == b"2:ip") {
+        let mut i = pos + 3;
+        if i < buf.len() && buf[i] == b':' {
+            i += 1;
+            let start = i;
+            while i < buf.len() && (buf[i].is_ascii_digit() || buf[i] == b'.') {
+                i += 1;
+            }
+            if start < i {
+                if let Ok(s) = std::str::from_utf8(&buf[start..i]) {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn pex_discover_peers(state: &AppState, ih_hex: &str, ih_raw: &[u8]) -> Result<usize> {
+    let seeds = state
+        .store
+        .list_peers(ih_hex, state.pex_max_peers_per_hash)
+        .await
+        .unwrap_or_default();
+    let mut inserted = 0usize;
+
+    for peer in seeds {
+        if peer.ip == "127.0.0.1" {
+            continue;
+        }
+        if let Ok(found) = pex_from_peer(&peer.ip, peer.port, ih_raw, state.pex_timeout).await {
+            for (ip, port) in found {
+                if ip != "127.0.0.1" && state.store.upsert_peer(ih_hex, &ip, port, None).await.is_ok() {
+                    inserted += 1;
+                }
+            }
+        }
+    }
+
+    if inserted > 0 {
+        debug!(ih=%ih_hex, inserted, "pex discovery inserted peers");
+    }
+    Ok(inserted)
+}
+
+async fn pex_from_peer(ip: &str, port: u16, ih_raw: &[u8], timeout: Duration) -> Result<Vec<(String, u16)>> {
+    let addr = format!("{}:{}", ip, port);
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await??;
+
+    let mut hs = Vec::with_capacity(68);
+    hs.push(19u8);
+    hs.extend_from_slice(b"BitTorrent protocol");
+    let mut reserved = [0u8; 8];
+    reserved[5] |= 0x10;
+    hs.extend_from_slice(&reserved);
+    hs.extend_from_slice(ih_raw);
+    let mut pid = [0u8; 20];
+    rand::thread_rng().fill(&mut pid);
+    hs.extend_from_slice(&pid);
+    tokio::time::timeout(timeout, stream.write_all(&hs)).await??;
+
+    let mut hs_resp = [0u8; 68];
+    tokio::time::timeout(timeout, stream.read_exact(&mut hs_resp)).await??;
+    if hs_resp[0] != 19 || &hs_resp[1..20] != b"BitTorrent protocol" {
+        return Ok(Vec::new());
+    }
+
+    let ext_handshake = b"d1:md6:ut_pexi1eee";
+    let mut msg = Vec::with_capacity(4 + 2 + ext_handshake.len());
+    msg.extend_from_slice(&((2 + ext_handshake.len()) as u32).to_be_bytes());
+    msg.push(20u8);
+    msg.push(0u8);
+    msg.extend_from_slice(ext_handshake);
+    tokio::time::timeout(timeout, stream.write_all(&msg)).await??;
+
+    let mut ut_pex_id: Option<u8> = None;
+    let mut found = Vec::new();
+    for _ in 0..6 {
+        let mut len_buf = [0u8; 4];
+        if tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > 1024 * 1024 {
+            continue;
+        }
+        let mut payload = vec![0u8; len];
+        tokio::time::timeout(timeout, stream.read_exact(&mut payload)).await??;
+        if payload.len() < 2 || payload[0] != 20 {
+            continue;
+        }
+        let ext_id = payload[1];
+        let body = &payload[2..];
+        if ext_id == 0 {
+            if let Some(id) = parse_ut_pex_ext_id(body) {
+                ut_pex_id = Some(id);
+                let req = b"de";
+                let mut ask = Vec::with_capacity(4 + 2 + req.len());
+                ask.extend_from_slice(&((2 + req.len()) as u32).to_be_bytes());
+                ask.push(20u8);
+                ask.push(id);
+                ask.extend_from_slice(req);
+                let _ = tokio::time::timeout(timeout, stream.write_all(&ask)).await;
+            }
+            continue;
+        }
+
+        if Some(ext_id) == ut_pex_id {
+            found.extend(extract_compact_from_added(body));
+        }
+    }
+    Ok(found)
+}
+
+fn parse_ut_pex_ext_id(payload: &[u8]) -> Option<u8> {
+    let pat = b"6:ut_pexi";
+    let pos = payload.windows(pat.len()).position(|w| w == pat)?;
+    let mut i = pos + pat.len();
+    let mut val: u16 = 0;
+    while i < payload.len() && payload[i].is_ascii_digit() {
+        val = val.saturating_mul(10).saturating_add((payload[i] - b'0') as u16);
+        i += 1;
+    }
+    if i < payload.len() && payload[i] == b'e' && val <= u8::MAX as u16 {
+        Some(val as u8)
+    } else {
+        None
+    }
+}
+
+fn extract_compact_from_added(payload: &[u8]) -> Vec<(String, u16)> {
+    let mut out = Vec::new();
+    if let Some(pos) = payload.windows(7).position(|w| w == b"5:added") {
+        let mut i = pos + 7;
+        let mut len = 0usize;
+        while i < payload.len() && payload[i].is_ascii_digit() {
+            len = len * 10 + (payload[i] - b'0') as usize;
+            i += 1;
+        }
+        if i < payload.len() && payload[i] == b':' {
+            i += 1;
+            if i + len <= payload.len() {
+                let peers = &payload[i..i + len];
+                if len % 6 == 0 {
+                    for chunk in peers.chunks(6) {
+                        let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]).to_string();
+                        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                        out.push((ip, port));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 async fn poll_loop(state: AppState) {
-    debug!(interval=?state.poll_interval, "poll loop started");
+    info!(interval=?state.poll_interval, dht_enable=state.dht_enable, pex_enable=state.pex_enable, "poll loop started");
     let st = Arc::new(state);
     loop {
         match st.store.list_all_infohashes(200).await { // heuristic limit
@@ -922,12 +1534,33 @@ async fn poll_loop(state: AppState) {
                             let subset = select_trackers(&http, st2.upstream_strategy, st2.batch_size, &st2.rr_index);
                             let params = UpstreamAnnounceParams { peer_id_encoded: (*PEER_ID_ENC).clone(), port: 6881, left: 16384, event: "started".to_string(), numwant: 200 };
                             let _ = fetch_from_upstreams(&st2, &subset, &ih, &raw, &params).await;
+                            if st2.dht_enable {
+                                let _ = dht_discover_peers(&st2, &ih, &raw).await;
+                            }
+                            if st2.pex_enable {
+                                let _ = pex_discover_peers(&st2, &ih, &raw).await;
+                            }
                         });
                     }
                 }
             }
             Err(e) => wlog!(?e, "list_all_infohashes failed"),
         }
+
+        // additional DHT crawler: probe random infohashes
+        if st.dht_enable {
+            debug!(queries=st.dht_random_queries, "launching random dht probes");
+            for _ in 0..st.dht_random_queries {
+                let mut raw = [0u8; 20];
+                rand::thread_rng().fill(&mut raw);
+                let hex = hex::encode(&raw);
+                let st2 = st.clone();
+                tokio::spawn(async move {
+                    let _ = dht_discover_peers(&st2, &hex, &raw).await;
+                });
+            }
+        }
+
         tokio::time::sleep(st.poll_interval).await;
     }
 }
